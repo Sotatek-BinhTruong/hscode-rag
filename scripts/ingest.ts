@@ -1,10 +1,11 @@
 /**
- * Main ingestion CLI: PDF → PageIndex → Gemini embeddings → Cloudflare Vectorize.
+ * Main ingestion CLI: PDF → PageIndex → Cloudflare Workers AI embeddings → Vectorize.
+ * Uses @cf/baai/bge-base-en-v1.5 (768 dims) via Workers AI REST API.
  *
  * Usage:
  *   cp ../.env.example .env && edit .env
  *   npm run ingest
- *   npm run ingest:dry   # parse + embed only, skip Vectorize upload
+ *   npm run ingest:dry   # parse only, skip embedding + upload
  */
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -16,39 +17,37 @@ import { uploadToVectorize } from './vectorize-uploader.ts'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DATASET_DIR = path.resolve(__dirname, '../dataset')
 
-// Gemini API: delay between embed calls to respect free-tier rate limit (~100 req/min)
-const EMBED_DELAY_MS = 650
-const GEMINI_EMBED_URL =
-  'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent'
+// Workers AI REST API — no geo-restrictions, same model used by the Worker at query time
+const EMBED_DELAY_MS = 100  // Workers AI has generous rate limits
 
 const isDryRun = process.argv.includes('--dry-run')
 
-async function embedText(text: string, taskType: 'RETRIEVAL_DOCUMENT' | 'RETRIEVAL_QUERY'): Promise<number[]> {
-  const apiKey = process.env.GEMINI_API_KEY
-  if (!apiKey) throw new Error('GEMINI_API_KEY not set in environment')
+async function embedText(text: string): Promise<number[]> {
+  const accountId = process.env.CF_ACCOUNT_ID
+  const apiToken = process.env.CF_API_TOKEN
+  if (!accountId || !apiToken) throw new Error('CF_ACCOUNT_ID or CF_API_TOKEN not set')
 
-  const res = await fetch(`${GEMINI_EMBED_URL}?key=${apiKey}`, {
+  const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/@cf/baai/bge-base-en-v1.5`
+  const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'models/gemini-embedding-001',
-      content: { parts: [{ text }] },
-      taskType,
-      outputDimensionality: 768,
-    }),
+    headers: {
+      'Authorization': `Bearer ${apiToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ text: [text] }),
   })
 
   if (!res.ok) {
     const err = await res.text()
-    throw new Error(`Gemini embed error ${res.status}: ${err}`)
+    throw new Error(`Workers AI embed error ${res.status}: ${err}`)
   }
 
-  const data = await res.json() as { embedding: { values: number[] } }
-  return data.embedding.values
+  const data = await res.json() as { result: { data: number[][] } }
+  return data.result.data[0]
 }
 
 function validateEnv(): void {
-  const required = ['GEMINI_API_KEY', 'CF_ACCOUNT_ID', 'CF_API_TOKEN', 'CF_VECTORIZE_INDEX']
+  const required = ['CF_ACCOUNT_ID', 'CF_API_TOKEN', 'CF_VECTORIZE_INDEX']
   const missing = required.filter(k => !process.env[k])
   if (missing.length > 0) {
     throw new Error(`Missing required env vars: ${missing.join(', ')}\nCopy .env.example → .env and fill in values.`)
@@ -83,14 +82,14 @@ async function main(): Promise<void> {
   }
 
   // Step 3: Embed all nodes
-  console.log(`\n🔢 Embedding ${nodes.length} nodes with gemini-embedding-001 (768 dims)...`)
+  console.log(`\n🔢 Embedding ${nodes.length} nodes with @cf/baai/bge-base-en-v1.5 (768 dims)...`)
   const embeddings: number[][] = []
 
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i]
-    // Use first 4000 chars for embedding (API input limit)
-    const textToEmbed = node.text.slice(0, 4000)
-    const embedding = await embedText(textToEmbed, 'RETRIEVAL_DOCUMENT')
+    // Use first 2000 chars — bge-base input limit is ~512 tokens
+    const textToEmbed = node.text.slice(0, 2000)
+    const embedding = await embedText(textToEmbed)
     embeddings.push(embedding)
 
     process.stdout.write(`\r   ${i + 1}/${nodes.length} embedded`)

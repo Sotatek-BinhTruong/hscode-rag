@@ -8,7 +8,7 @@ import { queryRoute } from './routes/query-route.ts'
 
 export type Bindings = {
   VECTORIZE: VectorizeIndex
-  GEMINI_API_KEY: string
+  AI: Ai
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
