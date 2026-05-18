@@ -1,0 +1,10 @@
+name = "hscode-rag-worker"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "hscode-rag-index"
+
+# Set API key via: npx wrangler secret put GEMINI_API_KEY

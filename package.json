@@ -1,0 +1,5 @@
+{
+  "name": "hscode-rag",
+  "private": true,
+  "workspaces": ["worker", "frontend", "scripts"]
+}
