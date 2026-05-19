@@ -17,7 +17,7 @@ export interface SearchResult {
 export async function searchVectorize(
   vectorize: VectorizeIndex,
   embedding: number[],
-  topK = 5
+  topK = 15
 ): Promise<SearchResult[]> {
   const results = await vectorize.query(embedding, {
     topK,
@@ -33,6 +33,7 @@ export async function searchVectorize(
     // hsCodes stored as comma-separated string in metadata
     hsCodes: String(match.metadata?.['hsCodes'] ?? '')
       .split(',')
+      .map(s => s.trim())
       .filter(Boolean),
     heading: String(match.metadata?.['heading'] ?? ''),
     text: String(match.metadata?.['text'] ?? ''),

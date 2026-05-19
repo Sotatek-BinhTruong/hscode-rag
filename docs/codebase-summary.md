@@ -20,8 +20,9 @@ This approach is ideal for tariff nomenclature documents where pages maintain lo
 |-----------|-----------|
 | **API Server** | Hono 4.x on Cloudflare Workers |
 | **Vector DB** | Cloudflare Vectorize |
-| **Embeddings** | Google Gemini `embedding-001` (768 dimensions) |
-| **LLM** | Google Gemini `gemini-2.0-flash` |
+| **Embeddings** | Cloudflare Workers AI (text-embedding-base) for query; Gemini `embedding-001` (768 dimensions) for ingestion |
+| **LLM** | Cloudflare Workers AI (Llama 3.3 70B) for generation |
+| **Hybrid Search** | Lexical reranking + RRF fusion (keyword match, Levenshtein fuzzy, HS code metadata boost) |
 | **Frontend** | React 19 + Vite + Tailwind CSS |
 | **CLI Scripts** | TypeScript + Node.js (tsx) |
 | **Package Manager** | npm workspaces (monorepo) |
@@ -45,15 +46,22 @@ PDF Files (dataset/)
     ↓
 [page-indexer.ts] Build PageIndex nodes → extract HS codes & headings
     ↓
-[Gemini embedding-001] Embed each node (768-dim vectors)
+[contextual-text-builder.ts] Prepend [Document][Chapter][Heading][HS Codes] to raw text
     ↓
-[vectorize-uploader.ts] Upload vectors → Cloudflare Vectorize
+[Gemini embedding-001] Embed contextual text (768-dim vectors)
     ↓
-[worker API] Retrieve via /query endpoint
+[vectorize-uploader.ts] Upload vectors + metadata → Cloudflare Vectorize
     ↓
-[Gemini 2.0-flash] Generate answers from context
+[worker API /query] Query flow:
+    ├─ Embed query with Cloudflare Workers AI
+    ├─ Vector search: topK=15 from Vectorize
+    ├─ HS code detection + keyword extraction (lexical)
+    ├─ Hybrid rerank: vector (0.6) + lexical + HS boost (1.0) + RRF
+    ├─ Slice top-5 + dedupe + score-threshold filter
+    ├─ Assemble context + citations
+    └─ Generate answer with Llama 3.3 70B
     ↓
-[React frontend] Display results to user
+[React frontend] Display answer + citations with relevance % 
 ```
 
 ## Directory Structure
@@ -65,34 +73,37 @@ worker/
 ├── src/
 │   ├── index.ts                          # Hono app entry point
 │   ├── routes/
-│   │   └── query-route.ts                # POST /query handler
+│   │   └── query-route.ts                # POST /query handler (orchestrates search→rerank→generate)
 │   └── services/
-│       ├── gemini-embed-service.ts       # Query embedding
-│       ├── vectorize-search-service.ts   # Vector similarity search
-│       ├── context-assembler.ts          # Build prompt context
-│       └── gemini-generate-service.ts    # LLM response generation
+│       ├── vectorize-search-service.ts   # Vector similarity search (topK=15)
+│       ├── hs-code-detector.ts           # Extract HS codes from query with regex
+│       ├── keyword-search-service.ts     # Keyword extraction + fuzzy matching (EN+VI stopwords)
+│       ├── reranker-service.ts           # Hybrid reranking: vector + lexical + HS boost + RRF
+│       ├── context-assembler.ts          # Dedupe, filter by score threshold, build citations
+│       └── workers-ai-generate-service.ts # LLM response generation (Llama 3.3, language mirroring)
 ├── wrangler.toml                         # Cloudflare Workers config
 └── package.json
 ```
 
 **Key endpoint:**
-- `POST /query` — Accepts question, returns answer with cited HS codes
+- `POST /query` — Accepts question; returns `{ answer, citations[] }` with cited HS codes and relevance %
 
 ### `/scripts` — Data Ingestion CLI
 
 ```
 scripts/
-├── ingest.ts                 # Main ingestion orchestrator
-├── pdf-page-parser.ts        # Extract text from PDF pages
-├── page-indexer.ts           # Build PageIndex nodes
-└── vectorize-uploader.ts     # Upload to Cloudflare Vectorize
+├── ingest.ts                     # Main ingestion orchestrator
+├── pdf-page-parser.ts            # Extract text from PDF pages
+├── page-indexer.ts               # Build PageIndex nodes + extract HS codes/headings
+├── contextual-text-builder.ts    # Prepend [Document][Chapter][Heading][HS Codes][Page] prefix
+└── vectorize-uploader.ts         # Upload vectors + metadata to Cloudflare Vectorize
 ```
 
 **Running ingestion:**
 ```bash
 cd scripts
-npm run ingest:dry    # Parse + embed only (no upload)
-npm run ingest        # Full pipeline: parse → embed → upload
+npm run ingest:dry    # Parse + embed only (no upload); shows sample contextual text
+npm run ingest        # Full pipeline: parse → build contextual text → embed → upload
 ```
 
 ### `/frontend` — React Chat UI
@@ -122,6 +133,58 @@ dataset/
 ```
 
 Filenames must match pattern `Chapter{N}.pdf` for chapter extraction.
+
+## Query Flow & Hybrid Search
+
+### Updated Query Pipeline (Post-Optimization)
+
+The `/query` endpoint now implements a **hybrid search** pattern with multiple ranking signals:
+
+1. **Vector Search** (Cloudflare Vectorize)
+   - Returns top-15 candidates based on embedding similarity
+   - Uses contextual embeddings: `[Document][Chapter][Heading][HS Codes] + page text`
+
+2. **Lexical Reranking** (in-memory, < 30ms)
+   - **HS code extraction:** Regex `\b\d{4}\.\d{2}(?:\.\d{2})?\b` matches queries like "0102.29.11"
+   - **Keyword extraction:** Tokenization + EN/VI stopword filtering (20-token Vietnamese list)
+   - **Fuzzy matching:** Levenshtein distance ≤ 2 for typo tolerance
+   - **Scoring components:**
+     - Vector cosine: `0.6 × score` (primary signal)
+     - HS code exact match: `+1.0` per match in metadata (dominant for HS-specific queries)
+     - Keyword in heading: `+0.20` (context boost)
+     - Keyword exact in text: `+0.10` per match, capped at 3
+     - Keyword fuzzy (Levenshtein ≤ 2): `+0.05`
+     - RRF (reciprocal rank fusion): `1/(60+rank) × 0.05` (tiebreaker)
+
+3. **Result Filtering & Deduplication**
+   - **Score threshold:** Drop results < 0.45 cosine (noise suppression; always keep top-1)
+   - **Deduplication:** Collapse multiple pages with same `document + heading`; merge HS codes
+   - **Top-5 candidates** returned to LLM for context
+
+4. **Context Assembly & Answer Generation**
+   - Build markdown-formatted context with citations
+   - Include `scorePct` (relevance %) in citation metadata
+   - LLM prompt: Llama 3.3 70B with language-mirroring instruction
+   - Fallback messages in both English and Vietnamese
+
+### Citation Interface
+
+```typescript
+interface Citation {
+  document: string       // e.g. "Chapter01.pdf"
+  chapterNum: number     // Chapter number
+  pageNum: number        // Physical page in PDF
+  heading: string        // Extracted commodity name/description
+  hsCodes: string[]      // Associated HS codes (deduplicated)
+  score: number          // Raw cosine similarity (0–1)
+  scorePct: number       // Relevance percentage (0–100, rounded)
+}
+```
+
+Example source label in generated context:
+```
+[1] Chapter01.pdf, Page 1 — OXEN (relevance 87%)
+```
 
 ## Key Concepts
 
@@ -167,21 +230,33 @@ This ensures all nodes are searchable by their relevant HS codes even if the pag
 
 ## Environment Configuration
 
-Create `scripts/.env` based on `.env.example`:
+### Scripts / Ingestion (`scripts/.env`)
 
 ```bash
-# Cloudflare credentials
+# Cloudflare credentials (for Vectorize upload during ingestion)
 CF_ACCOUNT_ID=your_cloudflare_account_id
 CF_API_TOKEN=your_api_token_with_vectorize_edit
 CF_VECTORIZE_INDEX=hscode-rag-index
 
-# Google Gemini API
+# Google Gemini API (for embedding ingestion, legacy support)
 GEMINI_API_KEY=your_gemini_api_key
 ```
 
-**Worker bindings** (set in `worker/wrangler.toml`):
-- `VECTORIZE` — Reference to Cloudflare Vectorize index
-- `GEMINI_API_KEY` — API key passed as secret
+### Worker Bindings (`worker/wrangler.toml`)
+
+```toml
+# Cloudflare Workers AI (automatic, no config needed)
+[env.production]
+[[env.production.ai]]
+binding = "AI"   # For text embedding queries + generating answers
+
+# Vectorize index binding
+[[env.production.vectorize]]
+binding = "VECTORIZE"
+index_name = "hscode-rag-index"
+```
+
+**Note:** Query embedding and answer generation now use Cloudflare Workers AI (no external API keys for query-time LLM calls).
 
 ## Quick Start
 

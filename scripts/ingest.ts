@@ -11,6 +11,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import { parseDatasetDir } from './pdf-page-parser.ts'
 import { buildPageIndex, type PageIndexNode } from './page-indexer.ts'
+import { buildContextualText } from './contextual-text-builder.ts'
 import { uploadToVectorize } from './vectorize-uploader.ts'
 
 // ESM __dirname equivalent
@@ -70,9 +71,10 @@ async function main(): Promise<void> {
   const nodes: PageIndexNode[] = buildPageIndex(rawPages)
   console.log(`\n📋 PageIndex built: ${nodes.length} nodes`)
 
-  // Preview first few nodes
+  // Preview first few nodes with contextual text sample
   nodes.slice(0, 3).forEach(n => {
     console.log(`   [${n.id}] "${n.heading}" — HS: ${n.hsCodes.slice(0, 2).join(', ')}`)
+    console.log(`   Contextual preview: ${buildContextualText(n).slice(0, 120).replace(/\n/g, '\\n')}`)
   })
 
   if (isDryRun) {
@@ -87,8 +89,8 @@ async function main(): Promise<void> {
 
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i]
-    // Use first 2000 chars — bge-base input limit is ~512 tokens
-    const textToEmbed = node.text.slice(0, 2000)
+    // Build contextual text: metadata prefix + page body, capped at 2000 chars
+    const textToEmbed = buildContextualText(node)
     const embedding = await embedText(textToEmbed)
     embeddings.push(embedding)
 
