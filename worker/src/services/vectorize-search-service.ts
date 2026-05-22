@@ -17,7 +17,7 @@ export interface SearchResult {
 export async function searchVectorize(
   vectorize: VectorizeIndex,
   embedding: number[],
-  topK = 15
+  topK = 5
 ): Promise<SearchResult[]> {
   const results = await vectorize.query(embedding, {
     topK,

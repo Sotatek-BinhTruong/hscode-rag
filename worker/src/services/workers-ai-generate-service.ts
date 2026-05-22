@@ -11,7 +11,6 @@ Language: respond in the SAME language as the user's question. If the question i
 
 Rules:
 - Cite each source using its label from context (e.g., [1] Chapter01.pdf, Page 1 — OXEN).
-- Always include the HS code(s) explicitly in your answer when available in the context (e.g., "HS Code: 0102.29.11").
 - When mentioning an HS code, use the exact format from context (e.g., 0102.29.11).
 - Be concise and precise.
 - If the answer is not in the context, say:
